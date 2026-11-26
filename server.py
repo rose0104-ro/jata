@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """JATA collection server. Public deployment requires TLS, persistent storage and private admin access."""
-import argparse, base64, hashlib, hmac, json, os, re, secrets, sqlite3, threading
+import argparse, base64, hashlib, hmac, json, os, re, secrets, sqlite3, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
@@ -53,6 +53,12 @@ class Handler(BaseHTTPRequestHandler):
   except Exception:pass
   if not quiet:self.respond(401,{'error':'private researcher access required'})
   return False
+ def admin_login(self, status=200, message=''):
+  # Never include the credential in the URL or the returned HTML.
+  page='''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>恰塔研究者入口</title><style> *{box-sizing:border-box}body{margin:0;background:#f5e3eb;color:#5b4554;font:16px/1.65 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;padding:20px}.panel{width:min(100%,440px);background:#fff8e9;border:2px solid #cda9bb;border-radius:20px;padding:28px;box-shadow:5px 6px #e7c5d6}h1{font-size:25px;margin:6px 0}small{color:#836579;letter-spacing:2px}label{display:block;font-weight:bold;margin:20px 0 6px}input,button{width:100%;font:inherit;padding:12px;border-radius:10px}input{border:1px solid #bc9dab;background:#fff}button{margin-top:14px;background:#a36e8c;color:#fff;border:0;font-weight:bold;cursor:pointer}.msg{color:#92384e;font-weight:bold}a{color:#80516c} </style></head><body><main class="panel"><small>JATA RESEARCH STUDIO</small><h1>恰塔研究者後台</h1><p>第一次登入請貼上 Railway 的 JATA_PRIVATE_LINK 金鑰。登入後，同一瀏覽器可直接按小恰塔進入後台。</p><form method="post" action="/admin/login"><label for="key">研究者金鑰</label><input id="key" name="key" type="password" required autocomplete="current-password" maxlength="128" autocapitalize="off" spellcheck="false"><button type="submit">登入研究後台</button></form><p class="msg" role="status">MESSAGE</p><a href="/">返回研究首頁</a></main></body></html>'''
+  return self.respond(status,page.replace('MESSAGE',message).encode(),'text/html; charset=utf-8')
+ def admin_grant(self):
+  self.send_response(303);self.send_header('Location','/admin');self.send_header('Set-Cookie','jata_admin='+KEY+'; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800');self.send_header('Referrer-Policy','no-referrer');self.send_header('Cache-Control','no-store');self.send_header('Content-Length','0');self.end_headers()
  def payload(self):
   size=int(self.headers.get('Content-Length','0'))
   if not 0<size<=120*1024*1024:raise ValueError('request size')
@@ -63,9 +69,9 @@ class Handler(BaseHTTPRequestHandler):
   try:
    if p in ('/','/index.html'):return self.respond(200,(ROOT/'index.html').read_bytes(),'text/html; charset=utf-8')
    if args.lan and p.startswith('/private/') and hmac.compare_digest(p[len('/private/'):],KEY):
-    self.send_response(303);self.send_header('Location','/admin');self.send_header('Set-Cookie','jata_admin='+KEY+'; Path=/; HttpOnly; Secure; SameSite=Strict');self.send_header('Referrer-Policy','no-referrer');self.send_header('Cache-Control','no-store');self.end_headers();return
-   if p in ('/admin','/admin.html'):
-    if not self.auth():return
+    return self.admin_grant()
+   if p in ('/admin','/admin.html','/admin/login'):
+    if not self.auth(quiet=True):return self.admin_login()
     return self.respond(200,(ROOT/'admin.html').read_bytes(),'text/html; charset=utf-8')
    if p=='/api/status':return self.respond(200,{'app':'JATA-COLLECT-3','ticketMode':'screenshot-reward-v9','formal':FORMAL,'ready':readiness() if FORMAL else False,'notice':NOTICE if FORMAL else ''})
    if p=='/api/assets':
@@ -123,6 +129,21 @@ class Handler(BaseHTTPRequestHandler):
  def do_POST(self):
   p=urlsplit(self.path).path
   try:
+   if p=='/admin/login':
+    if not args.lan:return self.admin_grant() if KEY else self.respond(400,{'error':'local mode: open /admin'})
+    if self.headers.get('Sec-Fetch-Site')=='cross-site':return self.admin_login(403,'請從本站的登入頁操作。')
+    n=int(self.headers.get('Content-Length','0'))
+    if not 0<n<=1024 or self.headers.get('Content-Type','').split(';')[0]!='application/x-www-form-urlencoded':return self.admin_login(400,'請從本站的登入頁輸入金鑰。')
+    val=parse_qs(self.rfile.read(n).decode('utf-8'),keep_blank_values=True).get('key',[''])[0].strip()
+    # Limit failed attempts globally without relying on spoofable proxy headers.
+    with AUTH_LOCK:
+     now=time.monotonic();recent=[t for t in ATTEMPTS.get('admin',[]) if now-t<60]
+     ATTEMPTS['admin']=recent
+     if len(recent)>=12:return self.admin_login(429,'嘗試次數過多，請一分鐘後再試。')
+     if not re.fullmatch(r'[A-Za-z0-9_-]{40,128}',val) or not hmac.compare_digest(val,KEY):
+      recent.append(now);return self.admin_login(401,'金鑰不正確，請確認 Railway 的 JATA_PRIVATE_LINK 設定。')
+     ATTEMPTS.pop('admin',None)
+    return self.admin_grant()
    if p=='/api/submit':
     if FORMAL and not readiness():return self.respond(503,{'error':'research not open'})
     d=self.payload();rs=d.get('records',[])
