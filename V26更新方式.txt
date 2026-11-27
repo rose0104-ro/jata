@@ -1,4 +1,0 @@
-將 index.html、admin.html、server.py 一起覆蓋原本 GitHub 專案根目錄，Commit changes 並確認 Railway 最新部署成功。保留 /data Volume，請勿清除研究紀錄。
-確認 https://jatakurimu.up.railway.app/api/status 顯示 version 為 V26，並用無痕視窗開啟 https://jatakurimu.up.railway.app/?v=26 。首頁及研究同意頁均標示 V26。
-僅保留一般錄音同意及原始錄音；舊轉錄端點回傳 410，不會傳送錄音至 AI。
-若仍顯示舊頁，請確認部署來源、GitHub 最新 commit、Railway 部署狀態，不必刪除資料。
