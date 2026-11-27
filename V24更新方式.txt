@@ -1,1 +1,0 @@
-V24：錄音同意只顯示「同意」「不同意」兩個按鈕；選擇後才能進入訪談，不同意仍可使用文字回答。沒有 AI 轉錄同意題或自動轉錄。若已部署 V23，可只更新 index.html；如版本不確定，請一併覆蓋 index.html、admin.html、server.py。保留 Railway /data Volume 與研究資料，更新前備份。
