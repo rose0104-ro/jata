@@ -1,0 +1,4 @@
+V25：只保留一般錄音同意、錄音試聽與下載。無 AI 或逐字稿介面。舊逐字稿資料不刪除，保留於資料庫。
+請一起覆蓋 GitHub 原專案的 index.html、admin.html、server.py；保留 Railway /data Volume，勿刪除資料庫。
+部署完成後首頁上方顯示 V25，後台亦顯示 V25。/api/status 的 version 應為 V25。
+若仍看到舊版請確認 Railway 部署成功後以新分頁或無痕視窗開啟。
