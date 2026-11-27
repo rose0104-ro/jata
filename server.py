@@ -36,10 +36,6 @@ with sqlite3.connect(DB) as c:
  c.execute('INSERT OR IGNORE INTO reward_settings VALUES (1,10,NULL)')
  c.execute('CREATE TABLE IF NOT EXISTS lottery_winners(id TEXT PRIMARY KEY, number INTEGER UNIQUE NOT NULL, drawn_at TEXT NOT NULL, round TEXT NOT NULL)')
  c.execute('CREATE TABLE IF NOT EXISTS transcripts(id TEXT NOT NULL, question TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY(id,question))')
- c.execute('CREATE TABLE IF NOT EXISTS live_transcribe_usage(day TEXT NOT NULL, journey TEXT NOT NULL, question TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(day,journey,question))')
- c.execute('CREATE TABLE IF NOT EXISTS live_transcribe_secret(id INTEGER PRIMARY KEY, secret TEXT NOT NULL)')
- c.execute('INSERT OR IGNORE INTO live_transcribe_secret VALUES (1,?)',(secrets.token_hex(32),))
- LIVE_SECRET=c.execute('SELECT secret FROM live_transcribe_secret WHERE id=1').fetchone()[0].encode()
 try: os.chmod(DB,0o600)
 except OSError: pass
 def readiness():
@@ -58,13 +54,20 @@ def contact_status(id):
   if row:return {'rewardKind':row[0],'lotteryNumber':f'{row[1]:04d}' if row[1] is not None else None}
   legacy=c.execute('SELECT number FROM contacts WHERE id=?',(id,)).fetchone()
   return {'rewardKind':'legacy' if legacy else 'none','lotteryNumber':f'{legacy[0]:04d}' if legacy else None}
+def strip_old_text(r):
+ # Do not display or accept retired transcription fields. Stored historical rows remain untouched.
+ for k in ('externalTranscription','externalTranscriptionLive'):
+  r.get('consent',{}).pop(k,None)
+ for section in ('answers','survey'):
+  for a in r.get(section,{}).values():
+   if isinstance(a,dict):
+    for k in ('transcript','transcriptReceipt21','transcriptStatus21'):a.pop(k,None)
+
 def snapshot(c):
  rs=[]
  for (raw,) in c.execute('SELECT payload FROM records ORDER BY rowid'):
   d=json.loads(raw);rs.extend(d['records'])
- lookup={r['id']:r for r in rs}
- for rid,k,t in c.execute('SELECT id,question,text FROM transcripts'):
-  if rid in lookup and k in lookup[rid].get('answers',{}):lookup[rid]['answers'][k]['transcript']=t
+ for r in rs: strip_old_text(r)
  return rs
 
 def draw_state(c):
@@ -106,15 +109,12 @@ def research_sheets(rs):
  def score(r,k,sub):
   if sub=='rating':return r.get('answers',{}).get(k,{}).get('rating')
   v=r.get('survey',{}).get(k,{}).get('value',{});v=v.get(sub) if isinstance(v,dict) else None;return v.get('rating') if isinstance(v,dict) else v
- wide=[['研究編號','模式','版本','分組','完成時間']+keys+[k+'_'+sub+'（數值）' for k,sub in numeric]];long=[['研究編號','模式','題號','題目','狀態','原始回答','錄音檔代碼','AI逐字稿']]
+ wide=[['研究編號','模式','版本','分組','完成時間']+keys+[k+'_'+sub+'（數值）' for k,sub in numeric]];long=[['研究編號','模式','題號','題目','狀態','原始回答','錄音檔代碼']]
  for r in rs:
   a={**r.get('answers',{}),**r.get('survey',{})};wide.append([r['id'],r['mode'],r.get('consent',{}).get('version'),r.get('group'),r.get('completedAt')]+[val(a.get(k)) for k in keys]+[score(r,k,sub) for k,sub in numeric])
   for k,v in a.items():
-   if isinstance(v,dict):long.append([r['id'],r['mode'],k,v.get('questionText',''),v.get('status',''),val({x:y for x,y in v.items() if x not in ('audio','transcript')}),v.get('audio',''),v.get('transcript','')])
+   if isinstance(v,dict):long.append([r['id'],r['mode'],k,v.get('questionText',''),v.get('status',''),val({x:y for x,y in v.items() if x not in ('audio','transcript')}),v.get('audio','')])
  return [('回答總表',wide),('逐題明細',long)]
-
-def transcript_receipt(rid,k,data,text):
- return hmac.new(LIVE_SECRET,json.dumps([rid,k,hashlib.sha256(data.encode()).hexdigest(),text],ensure_ascii=False,separators=(',',':')).encode(),hashlib.sha256).hexdigest()
 
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,fmt,*args): pass
@@ -150,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
    if p in ('/admin','/admin.html','/admin/login'):
     if not self.auth(quiet=True):return self.admin_login()
     return self.respond(200,(ROOT/'admin.html').read_bytes(),'text/html; charset=utf-8')
-   if p=='/api/status':return self.respond(200,{'app':'JATA-COLLECT-3','ticketMode':'shared-lottery-v16','formal':FORMAL,'ready':readiness() if FORMAL else False,'notice':NOTICE if FORMAL else '',**public_counts()})
+   if p=='/api/status':return self.respond(200,{'app':'JATA-COLLECT-3','version':'V25','ticketMode':'shared-lottery-v16','formal':FORMAL,'ready':readiness() if FORMAL else False,'notice':NOTICE if FORMAL else '',**public_counts()})
    if p=='/api/assets':
     with sqlite3.connect(DB) as c:
      rows=c.execute('SELECT id,name,version FROM assets').fetchall()
@@ -251,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
      ATTEMPTS.pop('admin',None)
     return self.admin_grant()
    if p=='/api/transcribe-answer':
-    return self.respond(410,{'error':'自動轉錄已停用，原始錄音仍可保存。'})
+    return self.respond(410,{'error':'此功能已停用，原始錄音仍可保存。'})
    if p=='/api/submit':
     if FORMAL and not readiness():return self.respond(503,{'error':'research not open'})
     d=self.payload();rs=d.get('records',[])
@@ -302,13 +302,7 @@ class Handler(BaseHTTPRequestHandler):
      for k,v in d.get('audio',{}).items():
       if k in allowed and isinstance(v,str) and re.match(r'^data:audio/[\w.+-]+(?:;codecs=[\w.+-]+)?;base64,',v) and len(v)<=42*1024*1024:audio[k]=v
     if r.get('rewardPolicy')=='v20' and allowed!=set(audio):raise ValueError('audio missing or invalid')
-    client_token=d.get('contactToken','');client_token=client_token if isinstance(client_token,str) else '';r.pop('contactEmail',None);r['consent'].pop('contact',None);r['consent']['externalTranscription']=r['consent'].get('recording') is True and r['consent'].get('externalTranscription') is True
-    # Accept only verified live AI text, bound to this exact audio, journey and question.
-    for k,a in answers.items():
-     if not isinstance(a,dict):continue
-     text=a.get('transcript');receipt=a.pop('transcriptReceipt21',None);raw=audio.get(a.get('audio',''))
-     if not (r['consent'].get('externalTranscription') and r['consent'].get('externalTranscriptionLive') is True and raw and isinstance(text,str) and 0<len(text)<=30000 and isinstance(receipt,str) and hmac.compare_digest(receipt,transcript_receipt(id,k,raw,text))):a.pop('transcript',None)
-     a.pop('transcriptStatus21',None)
+    client_token=d.get('contactToken','');client_token=client_token if isinstance(client_token,str) else '';r.pop('contactEmail',None);r['consent'].pop('contact',None);strip_old_text(r)
     d={'format':'JATA-RESEARCH-3','records':[r],'audio':audio}
     with sqlite3.connect(DB) as c:
      c.execute('BEGIN IMMEDIATE');old=c.execute('SELECT id FROM records WHERE id=?',(id,)).fetchone()
@@ -352,19 +346,9 @@ class Handler(BaseHTTPRequestHandler):
      batch=secrets.SystemRandom().sample(pool,min(len(pool),d['remaining']));at=datetime.datetime.now(datetime.timezone.utc).isoformat();round_id=secrets.token_hex(8)
      c.executemany('INSERT INTO lottery_winners VALUES (?,?,?,?)',[(i,n,at,round_id) for i,n in batch]);result=draw_state(c)
     return self.respond(200,result)
-   if p=='/api/admin/transcribe':
+   if p in ('/api/admin/transcribe','/api/admin/transcript'):
     if not self.auth():return
-    return self.respond(410,{'error':'自動轉錄已停用，請試聽或下載原始錄音。'})
-   if p=='/api/admin/transcript':
-    if not self.auth():return
-    if self.headers.get('Sec-Fetch-Site')=='cross-site':return self.respond(403,{'error':'cross-site'})
-    d=self.payload();rid=d.get('id');k=d.get('question');text=d.get('text')
-    if not isinstance(text,str) or not 0<len(text.strip())<=30000:raise ValueError('text')
-    with sqlite3.connect(DB) as c:
-     row=c.execute('SELECT payload FROM records WHERE id=?',(rid,)).fetchone()
-     if not row or not json.loads(row[0])['records'][0].get('answers',{}).get(k,{}).get('audio'):raise ValueError('audio')
-     c.execute('INSERT OR REPLACE INTO transcripts VALUES (?,?,?)',(rid,k,text.strip()))
-    return self.respond(200,{'text':text.strip()})
+    return self.respond(410,{'error':'此功能已停用，請試聽或下載原始錄音。'})
    if p=='/api/admin/reward-settings':
     if not self.auth():return
     if self.headers.get('Sec-Fetch-Site')=='cross-site':return self.respond(403,{'error':'cross-site'})
