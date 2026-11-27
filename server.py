@@ -150,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
    if p in ('/admin','/admin.html','/admin/login'):
     if not self.auth(quiet=True):return self.admin_login()
     return self.respond(200,(ROOT/'admin.html').read_bytes(),'text/html; charset=utf-8')
-   if p=='/api/status':return self.respond(200,{'app':'JATA-COLLECT-3','version':'V25','ticketMode':'shared-lottery-v16','formal':FORMAL,'ready':readiness() if FORMAL else False,'notice':NOTICE if FORMAL else '',**public_counts()})
+   if p=='/api/status':return self.respond(200,{'app':'JATA-COLLECT-3','version':'V26','ticketMode':'shared-lottery-v16','formal':FORMAL,'ready':readiness() if FORMAL else False,'notice':NOTICE if FORMAL else '',**public_counts()})
    if p=='/api/assets':
     with sqlite3.connect(DB) as c:
      rows=c.execute('SELECT id,name,version FROM assets').fetchall()
