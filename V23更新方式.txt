@@ -1,0 +1,1 @@
+V23：移除 AI 自動轉錄、同意選項及 API 提示，伺服器停用轉錄端點。保留原始錄音、手動逐字稿、歷史資料與 Excel。請在同一 GitHub 專案覆蓋 index.html、admin.html、server.py，保留 Railway /data Volume。OPENAI_API_KEY 若只供本站使用，可移除。更新前備份資料。

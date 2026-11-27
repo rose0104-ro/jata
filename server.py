@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """JATA collection server. Public deployment requires TLS, persistent storage and private admin access."""
-import argparse, base64, hashlib, hmac, json, os, re, secrets, sqlite3, threading, time, io, zipfile, urllib.request, datetime
+import argparse, base64, hashlib, hmac, json, os, re, secrets, sqlite3, threading, time, io, zipfile, datetime
 from xml.sax.saxutils import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -113,29 +113,8 @@ def research_sheets(rs):
    if isinstance(v,dict):long.append([r['id'],r['mode'],k,v.get('questionText',''),v.get('status',''),val({x:y for x,y in v.items() if x not in ('audio','transcript')}),v.get('audio',''),v.get('transcript','')])
  return [('回答總表',wide),('逐題明細',long)]
 
-TRANSCRIBE_LOCK=threading.Lock()
-def transcribe_audio(data):
- api=os.environ.get('OPENAI_API_KEY','')
- if not api:raise RuntimeError('尚未設定 OPENAI_API_KEY')
- m=re.fullmatch(r'data:(audio/[\w.+-]+)(?:;codecs=[\w.+-]+)?;base64,([A-Za-z0-9+/=]+)',data)
- if not m:raise RuntimeError('找不到有效錄音')
- blob=base64.b64decode(m[2],validate=True)
- if len(blob)>24*1024*1024:raise RuntimeError('錄音超過 24 MB，請下載分段轉錄')
- ext={'audio/mp4':'m4a','audio/mpeg':'mp3','audio/ogg':'ogg','audio/wav':'wav','audio/x-wav':'wav','audio/webm':'webm','audio/x-m4a':'m4a'}.get(m[1],'webm')
- b=secrets.token_hex(16);parts=[]
- for k,v in [('model','gpt-4o-mini-transcribe'),('prompt','保留原意及口語，中文使用繁體中文，不要摘要。')]:parts.append(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
- parts.extend([f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="answer.{ext}"\r\nContent-Type: {m[1]}\r\n\r\n'.encode(),blob,f'\r\n--{b}--\r\n'.encode()])
- req=urllib.request.Request('https://api.openai.com/v1/audio/transcriptions',data=b''.join(parts),headers={'Authorization':'Bearer '+api,'Content-Type':'multipart/form-data; boundary='+b})
- with urllib.request.urlopen(req,timeout=90) as res:t=json.load(res).get('text','').strip()
- if not t:raise RuntimeError('未取得逐字稿')
- return t
-
 def transcript_receipt(rid,k,data,text):
  return hmac.new(LIVE_SECRET,json.dumps([rid,k,hashlib.sha256(data.encode()).hexdigest(),text],ensure_ascii=False,separators=(',',':')).encode(),hashlib.sha256).hexdigest()
-
-def live_limit():
- try:return max(0,min(1000,int(os.environ.get('JATA_LIVE_TRANSCRIBE_DAILY_LIMIT','200'))))
- except ValueError:return 200
 
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,fmt,*args): pass
@@ -272,29 +251,7 @@ class Handler(BaseHTTPRequestHandler):
      ATTEMPTS.pop('admin',None)
     return self.admin_grant()
    if p=='/api/transcribe-answer':
-    if self.headers.get('Sec-Fetch-Site')=='cross-site':return self.respond(403,{'error':'cross-site'})
-    if FORMAL and not readiness():return self.respond(503,{'error':'研究尚未開放'})
-    if not os.environ.get('OPENAI_API_KEY'):return self.respond(503,{'error':'尚未設定 OPENAI_API_KEY，原音檔仍保留。'})
-    if not live_limit():return self.respond(503,{'error':'即時轉錄暫停，原音檔仍保留。'})
-    if int(self.headers.get('Content-Length','0'))>34*1024*1024:return self.respond(413,{'error':'錄音太大，請保留原檔。'})
-    d=self.payload();rid=d.get('id');k=d.get('question');data=d.get('audio');consent=d.get('consent',{})
-    if not isinstance(consent,dict) or any(consent.get(x) is not True for x in ('participation','recording','externalTranscription','externalTranscriptionLive')):return self.respond(403,{'error':'未取得即時 AI 轉錄同意'})
-    if not isinstance(rid,str) or not re.fullmatch(r'JATA-[A-Z0-9-]{1,80}',rid) or not isinstance(k,str) or not re.fullmatch(r'(?:Q[0-9]{2}(?:_V[1-8])?|[ABC][0-9]{2})',k) or not isinstance(data,str):raise ValueError('record or question')
-    m=re.fullmatch(r'data:(audio/[\w.+-]+)(?:;codecs=[\w.+-]+)?;base64,([A-Za-z0-9+/=]+)',data)
-    if not m or len(m[2])>32*1024*1024 or not base64.b64decode(m[2],validate=True):raise ValueError('audio')
-    # Persistent global and per-journey limits bound public API usage; no raw draft stored on server.
-    day=datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-    if not TRANSCRIBE_LOCK.acquire(blocking=False):return self.respond(429,{'error':'轉錄服務忙碌，請稍後重試。'})
-    try:
-     with sqlite3.connect(DB) as c:
-      c.execute('BEGIN IMMEDIATE');c.execute('DELETE FROM live_transcribe_usage WHERE day<>?',(day,))
-      if c.execute('SELECT COALESCE(SUM(count),0) FROM live_transcribe_usage WHERE day=?',(day,)).fetchone()[0]>=live_limit() or c.execute('SELECT COALESCE(SUM(count),0) FROM live_transcribe_usage WHERE day=? AND journey=?',(day,rid)).fetchone()[0]>=50 or c.execute('SELECT COALESCE(SUM(count),0) FROM live_transcribe_usage WHERE day=? AND journey=? AND question=?',(day,rid,k)).fetchone()[0]>=4:return self.respond(429,{'error':'即時轉錄額度已達上限，原音檔仍保留。'})
-      c.execute('INSERT INTO live_transcribe_usage VALUES (?,?,?,1) ON CONFLICT(day,journey,question) DO UPDATE SET count=count+1',(day,rid,k))
-     try:text=transcribe_audio(data)[:30000]
-     except RuntimeError as e:return self.respond(422,{'error':str(e)})
-     except Exception:return self.respond(502,{'error':'AI 轉錄失敗，原音檔仍保留。'})
-     return self.respond(200,{'text':text,'receipt':transcript_receipt(rid,k,data,text)})
-    finally:TRANSCRIBE_LOCK.release()
+    return self.respond(410,{'error':'自動轉錄已停用，原始錄音仍可保存。'})
    if p=='/api/submit':
     if FORMAL and not readiness():return self.respond(503,{'error':'research not open'})
     d=self.payload();rs=d.get('records',[])
@@ -397,24 +354,7 @@ class Handler(BaseHTTPRequestHandler):
     return self.respond(200,result)
    if p=='/api/admin/transcribe':
     if not self.auth():return
-    if self.headers.get('Sec-Fetch-Site')=='cross-site':return self.respond(403,{'error':'cross-site'})
-    d=self.payload();rid=d.get('id');k=d.get('question')
-    if not isinstance(rid,str) or not isinstance(k,str):raise ValueError('question')
-    with TRANSCRIBE_LOCK:
-     with sqlite3.connect(DB) as c:
-      row=c.execute('SELECT payload FROM records WHERE id=?',(rid,)).fetchone();old=c.execute('SELECT text FROM transcripts WHERE id=? AND question=?',(rid,k)).fetchone()
-     if old:return self.respond(200,{'text':old[0]})
-     if not row:return self.respond(404,{'error':'record missing'})
-     data=json.loads(row[0]);r=data['records'][0];a=r.get('answers',{}).get(k,{})
-     if a.get('transcript'):return self.respond(200,{'text':a['transcript']})
-     if not r.get('consent',{}).get('externalTranscription'):return self.respond(403,{'error':'未取得外部 AI 轉錄同意；請保留原音檔或自行逐字轉錄。'})
-     try:text=transcribe_audio(data.get('audio',{}).get(a.get('audio'),''))
-     except RuntimeError as e:return self.respond(422,{'error':str(e)})
-     except Exception:return self.respond(502,{'error':'轉錄服務失敗，原音檔仍保留；請確認 API 設定與餘額。'})
-     with sqlite3.connect(DB) as c:
-      if not c.execute('SELECT 1 FROM records WHERE id=?',(rid,)).fetchone():return self.respond(404,{'error':'record missing'})
-      c.execute('INSERT OR REPLACE INTO transcripts VALUES (?,?,?)',(rid,k,text))
-    return self.respond(200,{'text':text})
+    return self.respond(410,{'error':'自動轉錄已停用，請試聽或下載原始錄音。'})
    if p=='/api/admin/transcript':
     if not self.auth():return
     if self.headers.get('Sec-Fetch-Site')=='cross-site':return self.respond(403,{'error':'cross-site'})
